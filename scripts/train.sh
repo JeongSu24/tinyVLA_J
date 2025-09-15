@@ -6,7 +6,7 @@ export CUDA_VISIBLE_DEVICES=0
 ACTION_HEAD=droid_diffusion # specify action policy head type
 # define OUTPUT path
 
-OUTPUT="/home/parkjeongsu/TinyVLA/OUTPUT_llava_pythia_3"
+OUTPUT="/home/parkjeongsu/TinyVLA/OUTPUT_llava_pythia_4"
 
 if [ -d "$OUTPUT" ]; then
    echo 'output exists'
@@ -20,7 +20,7 @@ cp ./scripts/train.sh $OUTPUT
 # detailed usage of each parameter can be found in train_tinyvla.py
 # 
 #    --load_pretrain False \ ->  --load_pretrain True \ 
-#  --model_pretrain /home/parkjeongsu/TinyVLA/Llava-Pythia-400M/model.safetensors \ 는 내가 추가한것
+# 
 
 deepspeed --master_port 29600 --num_gpus=1 --num_nodes=1 ./train_tinyvla.py \
   --deepspeed /home/parkjeongsu/TinyVLA/llava-pythia/scripts/zero2.json \
@@ -38,16 +38,16 @@ deepspeed --master_port 29600 --num_gpus=1 --num_nodes=1 ./train_tinyvla.py \
   --freeze_vision_tower True \
   --freeze_backbone True \
   --mm_use_im_start_end False \
-  --mm_use_im_patch_token False \
+  --mm_use_im_patch_token True \
   --image_aspect_ratio pad \
   --group_by_modality_length False \
   --bf16 True \
   --output_dir $OUTPUT \
-  --max_steps 3000 \
-  --per_device_train_batch_size 8 \
+  --max_steps 20000 \
+  --per_device_train_batch_size 16 \
   --gradient_accumulation_steps 1 \
   --save_strategy "steps" \
-  --save_steps 1000 \
+  --save_steps 10000 \
   --save_total_limit 50 \
   --learning_rate 2e-4 \
   --weight_decay 0. \
@@ -63,7 +63,7 @@ deepspeed --master_port 29600 --num_gpus=1 --num_nodes=1 ./train_tinyvla.py \
   --concat "token_cat" \
   --report_to tensorboard \
   --logging_dir /home/parkjeongsu/TinyVLA/Llava-Pythia-400M/log \
-  --use_state False \
+  --use_state True \
   #--window_size 6 \
  
  

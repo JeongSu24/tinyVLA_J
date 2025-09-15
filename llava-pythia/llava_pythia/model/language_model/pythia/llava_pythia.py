@@ -39,6 +39,12 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
         self.head_type = config.action_head_type
         self.visual_concat = config.concat
         self.action_dim = config.action_dim
+        # 1) 새 LM head 추가 (언어용, 행동과 분리)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # LM을 학습하지 않으려면 동결
+        for p in self.lm_head.parameters():
+            p.requires_grad = False
+
         if config.action_head_type == 'act':
             self.embed_out = build_ACT_head(config.act['act'])
             middle_dim = int(max(config.hidden_size, config.act['act']['hidden_dim']) / 2)
@@ -117,12 +123,18 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
                 raise ValueError(f"Unimplentmented concat style:{visual_concat}")
         # Return final concatenated features
         return image_features
-
+    
+     # ✅ 여기 수정 포인트
     def get_output_embeddings(self):
-        return self.embed_out
+        # HF가 "LM head"로 다루는 모듈을 돌려준다.
+        # (절대 self.embed_out을 돌려주지 말 것!)
+        return self.lm_head
+        
+        return None
 
     def set_output_embeddings(self, new_embeddings):
-        self.embed_out = new_embeddings
+        # 토크나이저 리사이즈 등에서 HF가 호출
+        self.lm_head = new_embeddings
 
     def get_model(self):
         return self.gpt_neox

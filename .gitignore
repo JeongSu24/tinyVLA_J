@@ -177,4 +177,8 @@ Llava-Pythia-400M/
 OUTPUT_llava_pythia/
 OUTPUT_llava_pythia_0809/
 droid_with_lang_1/
+OUTPUT_llava_pythia3/
+
+#제외할 파일
+*.mp4
 

@@ -251,7 +251,7 @@ class ConditionalUnet1D(nn.Module):
                 timestep: Union[torch.Tensor, float, int],
                 global_cond=None,
                 states=None):
-        print("🔍 global_cond shape (forward):", global_cond.shape if global_cond is not None else None)
+       
 
         """
         Forward pass for the Conditional UNet.

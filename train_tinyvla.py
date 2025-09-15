@@ -9,9 +9,8 @@ os.environ["WANDB_DISABLED"] = "true"
 from data_utils.datasets import load_data  # data functions
 from data_utils.datasets import compute_dict_mean, set_seed  # helper functions
 
-from aloha_scripts.constants import TASK_CONFIGS
+from aloha_scripts.constants_geminie import TASK_CONFIGS
 from data_utils.datasets import LlavaPythiaProcess
-
 
 import IPython
 e = IPython.embed
@@ -20,16 +19,49 @@ from data_utils.processor import *
 from llava_pythia.train.llava_pythia_trainer import LLaVAPythiaTrainer
 from llava_pythia.model.language_model.pythia.llava_pythia import LlavaPythiaConfig
 
+from dataclasses import dataclass, field, asdict
+
 local_rank = None
+
+#내가 추가한 Callback class
+
+from transformers import TrainerCallback
+
+class LossConsoleCallback(TrainerCallback):
+    """
+    Trainer가 주기적으로 내보내는 logs(dict)를 콘솔에 예쁘게 출력.
+    - TrainerArguments.logging_steps 주기에 맞춰 on_log가 불려요.
+    """
+    def __init__(self, print_every: int = 1):
+        self.print_every = print_every
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        step = int(state.global_step) if state and state.global_step is not None else -1
+        # logging_steps에 맞춰서만 출력 (안전장치)
+        if step % max(1, self.print_every) != 0:
+            return
+
+        parts = [f"step={step}"]
+        if "loss" in logs:
+            parts.append(f"loss={logs['loss']:.4f}")
+        if "learning_rate" in logs:
+            parts.append(f"lr={logs['learning_rate']:.2e}")
+        # 선택: 평균 학습시간/속도 등도 logs에 있을 때 찍기
+        if "epoch" in logs:
+            parts.append(f"epoch={logs['epoch']:.2f}")
+        print(" | ".join(parts))
+
 
 #  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>parameters<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 @dataclass
 class ActionArguments:
     action_head_type: str = field(default="droid_diffusion") # action head type, 'act', 'droid_diffusion'
     action_dim: int = field(default=10)
-    state_dim: int = field(default=10)
+    state_dim: int = field(default=7)
     chunk_size: int = field(default=16) # size of action chunk, same as mobile aloha
-     # ✅ 이 줄 추가!
+     # 추가
     use_state: bool = field(default=False, metadata={"help": "Whether to use robot state as input to the policy"})
 @dataclass
 class ModelArguments:
@@ -47,7 +79,7 @@ class DataArguments:
     image_aspect_ratio: str = 'square'
     task_name: str = field(default="example_task_config")
     skip_mirrored_data: bool = field(default=True)
-
+    
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
@@ -175,12 +207,6 @@ def parse_pythia():
 
 def train_bc(train_dataset=None, val_dataset=None, model=None, config=None, sampler_params=None, tokenizer=None):
     """
-    Trains a model using the provided training and validation datasets.
-
-    This function initializes a data collator and a trainer, then starts the training process.
-    It saves the model state and configuration after training. If LoRA (Low-Rank Adaptation) is enabled
-    in the training arguments, it handles specific saving procedures for LoRA.
-
     Args:
         train_dataset: The dataset used for training.
         val_dataset: The dataset used for validation.
@@ -191,8 +217,13 @@ def train_bc(train_dataset=None, val_dataset=None, model=None, config=None, samp
     """
     set_seed(config['training_args'].seed)
 
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-
+    
+    #data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer) 아래 코드로 수정: state_use가 True, False 인걸 받으려고
+    data_collator = DataCollatorForSupervisedDataset(
+    tokenizer=tokenizer,
+    use_state=config['data_args'].use_state,          # ← 중요
+    state_dim=config['action_args'].state_dim         # 보통 7
+)
     data_module = dict(train_dataset=train_dataset,
                        data_collator=data_collator,
                        eval_dataset=val_dataset
@@ -201,8 +232,11 @@ def train_bc(train_dataset=None, val_dataset=None, model=None, config=None, samp
                                  tokenizer=tokenizer,
                                  args=config['training_args'],
                                  sampler_params=sampler_params,
+                                 callbacks=[LossConsoleCallback(print_every=config['training_args'].logging_steps)],
                                  **data_module)
-
+    
+    #--mm_use_im_patch_token True가 잘 작동되는지
+    
     trainer.train()
 
     trainer.save_state()

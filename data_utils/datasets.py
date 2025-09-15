@@ -19,42 +19,28 @@ def flatten_list(l):
 
 class EpisodicDataset(torch.utils.data.Dataset):
     """
-    It supports loading multi-camera images, actions, and robot states for each time step in an episode,
-    with optional augmentations and normalization. The data is loaded from HDF5 files, and padding is applied
-    to ensure consistent episode lengths.
+    멀티뷰 이미지, 액션, 로봇 상태를 에피소드 단위로 로딩하는 데이터셋.
+    HDF5에서 로드하고, 고정 chunk 길이에 맞춰 패딩/정규화를 적용.
     """
-    def __init__(self, dataset_path_list, camera_names, norm_stats, episode_ids, episode_len, chunk_size, policy_class, llava_pythia_process=None, imsize=480, data_args=None, use_state=False):
-        
-        self.use_state = use_state
-        print(f"✅ [Dataset] use_state = {self.use_state}")
-
-
-        """
-        Initializes the EpisodicDataset class with the given parameters.
-        
-        Args:
-            dataset_path_list (list of str): A list of file paths to the dataset files (e.g., HDF5 files), 
-                                              each corresponding to a different episode.
-            camera_names (list of str): A list of camera names (e.g., ['top', 'left', 'right']) indicating the 
-                                        cameras whose images are collected for each episode.
-            norm_stats (dict): A dictionary containing normalization statistics, including:
-                               - "action_mean" and "action_std" for normalizing actions,
-                               - "qpos_mean" and "qpos_std" for normalizing robot states (qpos).
-            episode_ids (list of int): A list of episode IDs that correspond to each entry in `dataset_path_list`. 
-                                       Each episode ID helps in locating the dataset file for that specific episode.
-            episode_len (list of int): A list of integers representing the lengths of each episode (number of time steps).
-                                       Used for calculating cumulative lengths and indexing.
-            chunk_size (int): The number of time steps (or data points) to return in each sample when the dataset is accessed.
-            policy_class (str): A string indicating the type of policy being used (e.g., "ACT", "diffusion").
-            llava_pythia_process (optional): An optional process or model for further processing the data after it is loaded.
-                                              This can be set to `None` if no additional processing is required.
-            imsize (int, default=480): The image size to which the images should be resized. Default is 480 pixels.
-        """
+    def __init__(self,
+                 dataset_path_list,
+                 camera_names,
+                 norm_stats,
+                 episode_ids,
+                 episode_len,
+                 chunk_size,
+                 policy_class,
+                 llava_pythia_process=None,
+                 imsize=480,
+                 data_args=None,
+                 use_state=False):
         super(EpisodicDataset).__init__()
-        self.episode_ids = episode_ids
+
+        # --- 설정 보관 ---
         self.dataset_path_list = dataset_path_list
         self.camera_names = camera_names
         self.norm_stats = norm_stats
+        self.episode_ids = episode_ids
         self.episode_len = episode_len
         self.chunk_size = chunk_size
         self.cumulative_len = np.cumsum(self.episode_len)
@@ -62,50 +48,52 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.policy_class = policy_class
         self.llava_pythia_process = llava_pythia_process
         self.imsize = imsize
+        self.use_state = use_state
+        print(f"✅ [Dataset] use_state = {self.use_state}")
+
         if self.imsize == 320:
             print("########################Current Image Size is [180,320]; maybe due to the pretrain data image size###################################")
-        if 'diffusion' in self.policy_class:
-            self.augment_images = True
-        else:
-            self.augment_images = False
-        self.transformations = None
-        a = self.__getitem__(0) # initialize self.is_sim and self.transformations
-        if 'image_top' in a and len(a['image_top'].shape) == 4: #수정함
 
+        # diffusion 계열이면 간단한 증강 수행
+        self.augment_images = True if 'diffusion' in self.policy_class else False
+        self.transformations = None
+
+        # __getitem__ 한 번 호출해서 파이프라인이 잘 돌아가는지/뷰 수 확인
+        a = self.__getitem__(0)
+        if isinstance(a, dict) and ('image_top' in a):
             print("%"*40)
-            print("There are three views: left, right, top")
-        # is_sim indicates whether the data comes from a simulation environment.
+  
+
+        # 시뮬/리얼 구분 플래그(에피소드별로 다를 수 있으나 참조용)
         self.is_sim = False
 
     def __len__(self):
         return sum(self.episode_len)
 
     def _locate_transition(self, index):
+        """글로벌 인덱스를 (에피소드ID, 에피소드 내 시작 타임스텝)으로 매핑."""
         assert index < self.cumulative_len[-1]
-        episode_index = np.argmax(self.cumulative_len > index) # argmax returns first True index
+        episode_index = np.argmax(self.cumulative_len > index)
         start_ts = index - (self.cumulative_len[episode_index] - self.episode_len[episode_index])
         episode_id = self.episode_ids[episode_index]
         return episode_id, start_ts
 
-
     def __getitem__(self, index):
         """
-        Retrieves a single data sample from the dataset at the specified index.
-
-        Args:
-            index (int): The index of the data sample to retrieve.
-
-        Returns:
-            Depending on the policy_class, either a tuple of (image_data, qpos_data, action_data, is_pad) 
-            or a processed sample dictionary containing image, state, action, is_pad, and raw_lang.
+        하나의 샘플 생성:
+          - 멀티뷰 이미지 1프레임(좌/우/탑)
+          - qpos 1스텝(옵션)
+          - start_ts부터의 액션 시퀀스(패딩 포함, 길이 chunk_size)
+          - is_pad 마스크
+          - raw_lang
         """
         episode_id, start_ts = self._locate_transition(index)
         dataset_path = self.dataset_path_list[episode_id]
-        # open the corresponding HDF5 file and read the necessary data attributes.
+
         with h5py.File(dataset_path, 'r') as root:
-            try: # some legacy data does not have this attribute
+            try:
                 is_sim = root.attrs['sim']
-            except:
+            except Exception:
                 is_sim = False
             compressed = root.attrs.get('compress', False)
 
@@ -115,58 +103,59 @@ class EpisodicDataset(torch.utils.data.Dataset):
             original_action_shape = action.shape
             episode_len = original_action_shape[0]
 
-            # qpos represents the robot's position (e.g., joint angles) at the given timestamp (start_ts),
-            # qvel represents the robot's velocity (e.g., joint velocities) at the same timestamp.
-            # get observation at start_ts only
+            # 관측(1프레임)
             qpos = root['/observations/qpos'][start_ts]
-            qvel = root['/observations/qvel'][start_ts]
-            image_dict = dict()
+            qvel = root['/observations/qvel'][start_ts]  # 현재는 사용하지 않음
+            image_dict = {}
             for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
-                if self.imsize != image_dict[cam_name].shape[1]:
-                    image_dict[cam_name] = cv2.resize(image_dict[cam_name], (320, 180))
+                img = root[f'/observations/images/{cam_name}'][start_ts]
+                # NOTE: 기존 코드의 (320,180) 하드코딩 유지. 필요 시 개선(keep_ratio 등) 가능.
+                if self.imsize != img.shape[1]:
+                    img = cv2.resize(img, (320, 180))
+                image_dict[cam_name] = img
 
             if compressed:
                 for cam_name in image_dict.keys():
                     decompressed_image = cv2.imdecode(image_dict[cam_name], 1)
                     image_dict[cam_name] = np.array(decompressed_image)
 
-            # get all actions after and including start_ts
+            # 액션 시퀀스: 시작 시점 이후로 패딩 포함
             if is_sim:
                 action = action[start_ts:]
                 action_len = episode_len - start_ts
             else:
-                action = action[max(0, start_ts - 1):] # hack, to make timesteps more aligned
-                action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
-        # pad actions to ensure consistent episode lengths.
+                # 약간의 정렬을 위해 한 스텝 당겨서 사용
+                action = action[max(0, start_ts - 1):]
+                action_len = episode_len - max(0, start_ts - 1)
+
+        # 패딩
         padded_action = np.zeros((self.max_episode_len, original_action_shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
-        is_pad = np.zeros(self.max_episode_len)
+        is_pad = np.zeros(self.max_episode_len, dtype=np.float32)
         is_pad[action_len:] = 1
 
+        # chunk 길이에 맞춰 자르기
         padded_action = padded_action[:self.chunk_size]
         is_pad = is_pad[:self.chunk_size]
 
-        # new axis for different cameras
-        all_cam_images = []
-        for cam_name in self.camera_names:
-            all_cam_images.append(image_dict[cam_name])
+        # 멀티뷰 스택 (K, H, W, C)
+        all_cam_images = [image_dict[cam] for cam in self.camera_names]
         all_cam_images = np.stack(all_cam_images, axis=0)
 
-        # construct observations
-        image_data = torch.from_numpy(all_cam_images)
-        qpos_data = torch.from_numpy(qpos).float()
-        action_data = torch.from_numpy(padded_action).float()
-        is_pad = torch.from_numpy(is_pad).bool()
+        # 텐서화
+        image_data = torch.from_numpy(all_cam_images)      # (K, H, W, C)
+        qpos_data = torch.from_numpy(qpos).float()         # (7,)
+        action_data = torch.from_numpy(padded_action).float()  # (T, 10)
+        is_pad = torch.from_numpy(is_pad).bool()           # (T,)
 
-        # convert the image data from BGR to RGB format 
-        if 'top' in self.camera_names:
-            image_data = torch.stack([torch.from_numpy(cv2.cvtColor(img.numpy(), cv2.COLOR_BGR2RGB)) for img in image_data], dim=0)
 
-        # channel last
+        # # 1) 채널 순서 (K, H, W, C) → (K, C, H, W)
         image_data = torch.einsum('k h w c -> k c h w', image_data)
 
-        # augmentation
+        # 2) float & [0,1] 정규화를 먼저
+        image_data = image_data.float() / 255.0 #image_data = image_data / 255.0
+
+        # 증강 초기화
         if self.transformations is None:
             print('Initializing transformations')
             original_size = image_data.shape[2:]
@@ -175,66 +164,73 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 transforms.RandomCrop(size=[int(original_size[0] * ratio), int(original_size[1] * ratio)]),
                 transforms.Resize(original_size, antialias=True),
                 transforms.RandomRotation(degrees=[-5.0, 5.0], expand=False),
-                transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5) #, hue=0.08)
+                transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
             ]
 
+        # (옵션) 증강
         if self.augment_images:
             for transform in self.transformations:
                 image_data = transform(image_data)
 
-        # normalize image and change dtype to float
-        image_data = image_data / 255.0
-
-        if 'diffusion' in self.policy_class: # for diffusion
-            # normalize to [-1, 1]
-            action_data = ((action_data - self.norm_stats["action_min"]) / (self.norm_stats["action_max"] - self.norm_stats["action_min"])) * 2 - 1
-        else: # for act
-            # normalize to mean 0 std 1
+        # 액션 정규화
+        if 'diffusion' in self.policy_class:
+            # [-1, 1] 스케일
+            action_data = ((action_data - self.norm_stats["action_min"]) /
+                           (self.norm_stats["action_max"] - self.norm_stats["action_min"])) * 2 - 1
+        else:
+            # 표준화
             action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
+        # qpos 표준화
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+
+        # ACT 정책은 기존 튜플 반환 유지
         if self.policy_class == 'ACT':
             return image_data, qpos_data, action_data, is_pad
+
+        # ---- 샘플 구성 (processor.forward_process로 넘길 입력) ----
         sample = {
             'image': image_data,
-            'state': qpos_data,
             'action': action_data,
             'is_pad': is_pad,
-            'raw_lang': raw_lang
+            'raw_lang': raw_lang,
         }
-        
-        if hasattr(self.llava_pythia_process.data_args, 'use_state'):
+        # use_state 정책에 따라 state를 조건부로 첨부
+        if self.use_state:
+            sample['state'] = qpos_data
+
+        # processor 쪽 플래그를 우선, 없으면 자기 플래그 사용
+        if hasattr(self.llava_pythia_process, 'data_args') and hasattr(self.llava_pythia_process.data_args, 'use_state'):
             sample['use_state'] = self.llava_pythia_process.data_args.use_state
+        else:
+            sample['use_state'] = self.use_state
 
         return self.llava_pythia_process.forward_process(sample)
-        # print(image_data.dtype, qpos_data.dtype, action_data.dtype, is_pad.dtype)
 
 
 class LlavaPythiaProcess:
-    def __init__(
-            self,
-            data_args=None,
-            tokenizer=None,
-    ):
+    """
+    (참고용/백업) dataset.py 내부 프로세서.
+    실제 실행에선 외부에서 주입된 llava_pythia_process를 사용하므로,
+    이 클래스는 사용되지 않을 수 있음.
+    """
+    def __init__(self, data_args=None, tokenizer=None):
         super().__init__()
-
         self.data_args = data_args
         self.processor = self.data_args.image_processor
         self.tokenizer = tokenizer
-        # self.language = language
 
     def parse_image(self, image_file):
-        # image_file = self.list_data_dict[i]['image']
-
         image = image_file
         if isinstance(image, torch.Tensor):
             image = image.permute(0, 2, 3, 1).numpy()
+
         if self.data_args.image_aspect_ratio == 'pad':
             def expand2square_batch_numpy(pil_imgs, background_color):
                 batch_size, height, width, channels = pil_imgs.shape
                 max_dim = max(height, width)
-                expanded_imgs = np.full((batch_size, max_dim, max_dim, channels), background_color, dtype=np.float32)
-
+                expanded_imgs = np.full((batch_size, max_dim, max_dim, channels),
+                                        background_color, dtype=np.float32)
                 if height == width:
                     expanded_imgs[:, :height, :width] = pil_imgs
                 elif height > width:
@@ -243,7 +239,6 @@ class LlavaPythiaProcess:
                 else:
                     offset = (max_dim - height) // 2
                     expanded_imgs[:, offset:offset + height, :width] = pil_imgs
-
                 return expanded_imgs
 
             image = expand2square_batch_numpy(image, tuple(x for x in self.processor.image_mean))
@@ -255,23 +250,8 @@ class LlavaPythiaProcess:
         return image
 
     def forward_process(self, sample):
-        """
-        Processes a sample from the dataset to prepare it for model input.
-
-        Args:
-            sample (dict): A dictionary containing the sample data. It includes keys like 'image', 'state', 'action', and 'is_pad'.
-
-        Returns:
-            dict: A dictionary containing processed data ready for model input. It includes:
-                - 'input_ids': Tokenized input IDs for the language model.
-                - 'labels': Corresponding labels for the input IDs.
-                - 'image': The first image from the sample, processed.
-                - 'image_r': The second image from the sample, processed.
-                - 'image_top': The third image from the sample, processed (if available).
-                - 'state': The state data from the sample.
-                - 'action': The action data from the sample.
-                - 'is_pad': Padding information for the sample.
-        """
+        # sample['use_state'] 플래그를 존중해서 state를 붙이거나 생략하도록 processor.py와 동일 정책을 유지하려면
+        # 여기서도 필요시 조건부 첨부하도록 바꿀 수 있음(현재는 외부 프로세서 사용 가정).
         sources = self.datastruct_droid2llava(sample)
         image = self.parse_image(sample['image'])
 
@@ -279,23 +259,22 @@ class LlavaPythiaProcess:
             sources = [sources]
         sources = preprocess_multimodal(
             copy.deepcopy([e["conversations"] for e in sources]),
-            self.data_args)
+            self.data_args
+        )
 
-        data_dict = preprocess(
-            sources,
-            self.tokenizer,
-            has_image=True)
-
-        data_dict = dict(input_ids=data_dict["input_ids"][0],
-                         labels=data_dict["labels"][0])
+        data_dict_tok = preprocess(sources, self.tokenizer, has_image=True)
+        data_dict = dict(input_ids=data_dict_tok["input_ids"][0],
+                         labels=data_dict_tok["labels"][0])
 
         images_all = torch.chunk(image, image.shape[0], dim=0)
         data_dict['image'] = images_all[0]
         data_dict['image_r'] = images_all[1]
         if image.shape[0] == 3:
-
             data_dict['image_top'] = images_all[2]
-        data_dict['state'] = sample['state']
+
+        # --- 여기서는 sample['use_state']를 확인해서 조건부 첨부 ---
+        if sample.get('use_state', True) and ('state' in sample):
+            data_dict['state'] = sample['state']
         data_dict['action'] = sample['action']
         data_dict['is_pad'] = sample['is_pad']
         return data_dict
@@ -306,36 +285,19 @@ class LlavaPythiaProcess:
             'image': None,
             'state': [],
             'action': [],
-            "conversations": [{"from": "human", "value": "<image>\n"}, {"from": "gpt", "value": " "}]
+            "conversations": [{"from": "human", "value": "<image>\n"},
+                              {"from": "gpt", "value": " "}]
         }
         sources['action'] = sample['action']
-        sources['state'] = sample['state']
-        # sources['image'] = sample['obs']['camera/image/varied_camera_1_left_image']
+        if 'state' in sample:
+            sources['state'] = sample['state']
         sources["conversations"][0]["value"] += sample['raw_lang']
-        # print(sample['obs']['raw_language'].decode('utf-8'))
         return sources
+
 
 def get_norm_stats(dataset_path_list):
     """
-    Computes normalization statistics for action and qpos data from a list of dataset paths. Prepare to standardize the action data and robot position data (qpos data).
-
-    Args:
-        dataset_path_list (list of str): A list of file paths to the dataset files (e.g., HDF5 files).
-
-    Returns:
-        tuple: A tuple containing:
-            - stats (dict): A dictionary with the following keys:
-                - "action_mean": The mean of the action data across all episodes.
-                - "action_std": The standard deviation of the action data, clipped to a minimum of 0.01.
-                - "action_min": The minimum value of the action data, adjusted by a small epsilon.
-                - "action_max": The maximum value of the action data, adjusted by a small epsilon.
-                - "qpos_mean": The mean of the qpos data across all episodes.
-                - "qpos_std": The standard deviation of the qpos data, clipped to a minimum of 0.01.
-                - "example_qpos": An example qpos array from the last processed dataset.
-            - all_episode_len (list of int): A list of integers representing the lengths of each episode.
-
-    Raises:
-        Exception: If there is an error loading a dataset file, the function will print an error message and terminate the program.
+    액션/상태(qpos) 정규화 통계 계산 + 각 에피소드 길이 수집.
     """
     all_qpos_data = []
     all_action_data = []
@@ -357,37 +319,42 @@ def get_norm_stats(dataset_path_list):
     all_qpos_data = torch.cat(all_qpos_data, dim=0)
     all_action_data = torch.cat(all_action_data, dim=0)
 
-    # normalize action data
     action_mean = all_action_data.mean(dim=[0]).float()
     action_std = all_action_data.std(dim=[0]).float()
-    action_std = torch.clip(action_std, 1e-2, np.inf) # clipping
+    action_std = torch.clip(action_std, 1e-2, np.inf)
 
-    # normalize qpos data
     qpos_mean = all_qpos_data.mean(dim=[0]).float()
     qpos_std = all_qpos_data.std(dim=[0]).float()
-    qpos_std = torch.clip(qpos_std, 1e-2, np.inf) # clipping
+    qpos_std = torch.clip(qpos_std, 1e-2, np.inf)
 
     action_min = all_action_data.min(dim=0).values.float()
     action_max = all_action_data.max(dim=0).values.float()
 
-    eps = 0.0001
-    stats = {"action_mean": action_mean.numpy(), "action_std": action_std.numpy(),
-             "action_min": action_min.numpy() - eps,"action_max": action_max.numpy() + eps,
-             "qpos_mean": qpos_mean.numpy(), "qpos_std": qpos_std.numpy(),
-             "example_qpos": qpos}
-
+    eps = 1e-4
+    stats = {
+        "action_mean": action_mean.numpy(),
+        "action_std": action_std.numpy(),
+        "action_min": (action_min.numpy() - eps),
+        "action_max": (action_max.numpy() + eps),
+        "qpos_mean": qpos_mean.numpy(),
+        "qpos_std": qpos_std.numpy(),
+        "example_qpos": qpos,
+    }
     return stats, all_episode_len
+
 
 def find_all_hdf5(dataset_dir, skip_mirrored_data):
     hdf5_files = []
     for root, dirs, files in os.walk(dataset_dir):
         for filename in fnmatch.filter(files, '*.hdf5'):
-            if 'features' in filename: continue
+            if 'features' in filename:
+                continue
             if skip_mirrored_data and 'mirror' in filename:
                 continue
             hdf5_files.append(os.path.join(root, filename))
     print(f'Found {len(hdf5_files)} hdf5 files')
     return hdf5_files
+
 
 def BatchSampler(batch_size, episode_len_l, sample_weights):
     sample_probs = np.array(sample_weights) / np.sum(sample_weights) if sample_weights is not None else None
@@ -400,47 +367,31 @@ def BatchSampler(batch_size, episode_len_l, sample_weights):
             batch.append(step_idx)
         yield batch
 
-def load_data(dataset_dir_l, name_filter, camera_names, batch_size_train, batch_size_val, chunk_size, config, skip_mirrored_data=False, policy_class=None, stats_dir_l=None, sample_weights=None, train_ratio=0.99, return_dataset=False, llava_pythia_process=None, use_state=False):
-    """
-    Loads and prepares datasets for training and evaluation.
 
-    Args:
-        dataset_dir_l (list or str): A list of directories or a single directory containing dataset files.
-        name_filter (function): A function to filter dataset files based on their names.
-        camera_names (list of str): A list of camera names to be used for data collection.
-        batch_size_train (int): The batch size for training.
-        batch_size_val (int): The batch size for validation.
-        chunk_size (int): The number of time steps to return in each sample.
-        config (dict): Configuration dictionary containing various settings, including image size.
-        skip_mirrored_data (bool, optional): Whether to skip mirrored data files. Defaults to False.
-        policy_class (str, optional): The type of policy being used (e.g., "ACT", "diffusion"). Defaults to None.
-        stats_dir_l (list or str, optional): Directories for computing normalization statistics. Defaults to None.
-        sample_weights (list, optional): Weights for sampling episodes. Defaults to None.
-        train_ratio (float, optional): The ratio of data to be used for training. Defaults to 0.99.
-        return_dataset (bool, optional): Whether to return the datasets and parameters. Defaults to False.
-        llava_pythia_process (object, optional): An optional process for further data processing. Defaults to None.
-
-    Returns:
-        tuple: If `return_dataset` is True, returns a tuple containing:
-            - train_dataset (EpisodicDataset): The training dataset.
-            - val_dataset (EpisodicDataset): The validation dataset.
-            - norm_stats (dict): Normalization statistics.
-            - sampler_params (dict): Parameters for data sampling.
+def load_data(dataset_dir_l, name_filter, camera_names,
+             batch_size_train, batch_size_val, chunk_size, config,
+             skip_mirrored_data=False, policy_class=None, stats_dir_l=None,
+             sample_weights=None, train_ratio=0.99, return_dataset=False,
+             llava_pythia_process=None, use_state=False):
     """
-    if type(dataset_dir_l) == str:
+    학습/검증 데이터셋과 정규화 통계, 샘플러 파라미터를 생성.
+    """
+    if isinstance(dataset_dir_l, str):
         dataset_dir_l = [dataset_dir_l]
     dataset_path_list_list = [find_all_hdf5(dataset_dir, skip_mirrored_data) for dataset_dir in dataset_dir_l]
     num_episodes_0 = len(dataset_path_list_list[0])
     dataset_path_list = flatten_list(dataset_path_list_list)
     dataset_path_list = [n for n in dataset_path_list if name_filter(n)]
-    num_episodes_l = [len(dataset_path_list) for dataset_path_list in dataset_path_list_list]
+    num_episodes_l = [len(d) for d in dataset_path_list_list]
     num_episodes_cumsum = np.cumsum(num_episodes_l)
 
-    # obtain train test split on dataset_dir_l[0]
+    # split은 첫 디렉토리 기준
     shuffled_episode_ids_0 = np.random.permutation(num_episodes_0)
     train_episode_ids_0 = shuffled_episode_ids_0[:int(train_ratio * num_episodes_0)]
     val_episode_ids_0 = shuffled_episode_ids_0[int(train_ratio * num_episodes_0):]
-    train_episode_ids_l = [train_episode_ids_0] + [np.arange(num_episodes) + num_episodes_cumsum[idx] for idx, num_episodes in enumerate(num_episodes_l[1:])]
+    train_episode_ids_l = [train_episode_ids_0] + [
+        np.arange(num) + num_episodes_cumsum[idx] for idx, num in enumerate(num_episodes_l[1:])
+    ]
     val_episode_ids_l = [val_episode_ids_0]
 
     train_episode_ids = np.concatenate(train_episode_ids_l)
@@ -452,29 +403,47 @@ def load_data(dataset_dir_l, name_filter, camera_names, batch_size_train, batch_
     val_episode_len_l = [[all_episode_len[i] for i in val_episode_ids] for val_episode_ids in val_episode_ids_l]
     train_episode_len = flatten_list(train_episode_len_l)
     val_episode_len = flatten_list(val_episode_len_l)
+
     if stats_dir_l is None:
         stats_dir_l = dataset_dir_l
-    elif type(stats_dir_l) == str:
+    elif isinstance(stats_dir_l, str):
         stats_dir_l = [stats_dir_l]
     norm_stats, _ = get_norm_stats(flatten_list([find_all_hdf5(stats_dir, skip_mirrored_data) for stats_dir in stats_dir_l]))
     print(f'Norm stats from: {stats_dir_l}')
     print(f'train_episode_len_l: {train_episode_len_l}')
 
-    train_dataset = EpisodicDataset(dataset_path_list, camera_names, norm_stats, train_episode_ids, train_episode_len, chunk_size, policy_class, llava_pythia_process=llava_pythia_process, imsize=config['training_args'].pretrain_image_size)
-    val_dataset = EpisodicDataset(dataset_path_list, camera_names, norm_stats, val_episode_ids, val_episode_len, chunk_size, policy_class, llava_pythia_process=llava_pythia_process, imsize=config['training_args'].pretrain_image_size, use_state=config['action_args'].use_state) # 추가
+    # --- use_state를 train/val 모두에 동일하게 전달 ---
+    use_state_flag = config['action_args'].use_state if 'action_args' in config else use_state
+
+    train_dataset = EpisodicDataset(
+        dataset_path_list, camera_names, norm_stats,
+        train_episode_ids, train_episode_len, chunk_size, policy_class,
+        llava_pythia_process=llava_pythia_process,
+        imsize=config['training_args'].pretrain_image_size,
+        use_state=use_state_flag
+    )
+    val_dataset = EpisodicDataset(
+        dataset_path_list, camera_names, norm_stats,
+        val_episode_ids, val_episode_len, chunk_size, policy_class,
+        llava_pythia_process=llava_pythia_process,
+        imsize=config['training_args'].pretrain_image_size,
+        use_state=use_state_flag
+    )
 
     sampler_params = {
-        'train': {"batch_size": batch_size_train, 'episode_len_l': train_episode_len_l, 'sample_weights':sample_weights},
-        'eval': {"batch_size": batch_size_val, 'episode_len_l': val_episode_len_l, 'sample_weights': None}
+        'train': {"batch_size": batch_size_train, 'episode_len_l': train_episode_len_l, 'sample_weights': sample_weights},
+        'eval':  {"batch_size": batch_size_val,   'episode_len_l': val_episode_len_l,   'sample_weights': None}
     }
 
     if return_dataset:
         return train_dataset, val_dataset, norm_stats, sampler_params
 
 
+# ===== 아래는 베이스(모바일 등) 환경에 쓰던 유틸 =====
+
 def calibrate_linear_vel(base_action, c=None):
     if c is None:
-        c = 0.0 # 0.19
+        c = 0.0
     v = base_action[..., 0]
     w = base_action[..., 1]
     base_action = base_action.copy()
@@ -487,60 +456,15 @@ def smooth_base_action(base_action):
     ], axis=-1).astype(np.float32)
 
 def preprocess_base_action(base_action):
-    # base_action = calibrate_linear_vel(base_action)
-    base_action = smooth_base_action(base_action)
-
-    return base_action
+    return smooth_base_action(base_action)
 
 def postprocess_base_action(base_action):
     linear_vel, angular_vel = base_action
     linear_vel *= 1.0
     angular_vel *= 1.0
-    # angular_vel = 0
-    # if np.abs(linear_vel) < 0.05:
-    #     linear_vel = 0
     return np.array([linear_vel, angular_vel])
 
-### env utils
-
-def sample_box_pose():
-    x_range = [0.0, 0.2]
-    y_range = [0.4, 0.6]
-    z_range = [0.05, 0.05]
-
-    ranges = np.vstack([x_range, y_range, z_range])
-    cube_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
-
-    cube_quat = np.array([1, 0, 0, 0])
-    return np.concatenate([cube_position, cube_quat])
-
-def sample_insertion_pose():
-    # Peg
-    x_range = [0.1, 0.2]
-    y_range = [0.4, 0.6]
-    z_range = [0.05, 0.05]
-
-    ranges = np.vstack([x_range, y_range, z_range])
-    peg_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
-
-    peg_quat = np.array([1, 0, 0, 0])
-    peg_pose = np.concatenate([peg_position, peg_quat])
-
-    # Socket
-    x_range = [-0.2, -0.1]
-    y_range = [0.4, 0.6]
-    z_range = [0.05, 0.05]
-
-    ranges = np.vstack([x_range, y_range, z_range])
-    socket_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
-
-    socket_quat = np.array([1, 0, 0, 0])
-    socket_pose = np.concatenate([socket_position, socket_quat])
-
-    return peg_pose, socket_pose
-
-### helper functions
-
+# 기타 헬퍼
 def compute_dict_mean(epoch_dicts):
     result = {k: None for k in epoch_dicts[0]}
     num_items = len(epoch_dicts)
@@ -552,10 +476,7 @@ def compute_dict_mean(epoch_dicts):
     return result
 
 def detach_dict(d):
-    new_d = dict()
-    for k, v in d.items():
-        new_d[k] = v.detach()
-    return new_d
+    return {k: v.detach() for k, v in d.items()}
 
 def set_seed(seed):
     torch.manual_seed(seed)

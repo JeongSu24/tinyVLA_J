@@ -1,5 +1,5 @@
 import copy
-from dataclasses import dataclass, field, fields, asdict
+from dataclasses import dataclass
 import json
 import logging
 import pathlib
@@ -85,22 +85,7 @@ def preprocess_multimodal(
         sources: Sequence[str],
         data_args,
 ) -> Dict:
-    """
-    Preprocesses a list of multimodal sources by modifying image tokens.
-
-    This function checks if the data is multimodal based on the `data_args` parameter.
-    If it is, it processes each source and its sentences to handle image tokens.
-    Specifically, it replaces the default image token with a formatted version,
-    optionally adding start and end tokens around it.
-
-    Args:
-        sources (Sequence[str]): A sequence of source data, where each source is a list of sentences.
-        data_args: An object containing data arguments, including whether the data is multimodal
-                   and whether to use start and end tokens for images.
-
-    Returns:
-        Dict: The processed sources with modified image tokens.
-    """
+    """멀티모달 입력에서 이미지 토큰 래핑/치환."""
     is_multimodal = data_args.is_multimodal
     if not is_multimodal:
         return sources
@@ -124,29 +109,13 @@ def preprocess_v0(
         tokenizer: transformers.PreTrainedTokenizer,
         has_image: bool = False
 ) -> Dict:
-    """
-    Preprocesses a list of conversation sources for tokenization.
-
-    This function processes a list of conversation sources, applying prompt templates
-    and tokenizing the conversations. It handles both text and multimodal data (if images are present).
-    The function also masks certain parts of the tokenized data to ignore them during training.
-
-    Args:
-        sources (list): A list of conversation sources, where each source is a list of sentences.
-        tokenizer (transformers.PreTrainedTokenizer): A tokenizer to convert text into token IDs.
-        has_image (bool): A flag indicating whether the data includes images.
-
-    Returns:
-        Dict: A dictionary containing tokenized input IDs and labels.
-    """
+    """대화 템플릿을 적용하고 토크나이즈 + Loss 마스킹."""
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
-    # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
@@ -156,7 +125,6 @@ def preprocess_v0(
             conv.append_message(role, sentence["value"])
         conversations.append(conv.get_prompt())
 
-    # Tokenize conversations
     if has_image:
         input_ids = torch.stack(
             [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
@@ -170,15 +138,13 @@ def preprocess_v0(
         ).input_ids
 
     targets = input_ids.clone()
-
     assert conv.sep_style == conversation_lib.SeparatorStyle.TWO
 
-    # Mask targets
     sep = conv.sep + conv.roles[1] + ": "
     for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum()) # in phi-2, pad_token_id == eos_token_id
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
         if 'phi' in tokenizer.name_or_path.lower():
-            total_len +=1
+            total_len += 1
         rounds = conversation.split(conv.sep2)
         cur_len = 0
         if cur_len > 0:
@@ -193,14 +159,13 @@ def preprocess_v0(
             parts[0] += sep
 
             if has_image:
-                round_len = len(tokenizer_image_token(rou, tokenizer)) + 1  # +1 for <|endoftext|>
+                round_len = len(tokenizer_image_token(rou, tokenizer)) + 1
                 instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
             else:
-                round_len = len(tokenizer(rou).input_ids) + 1  # +1 for <|endoftext|>
+                round_len = len(tokenizer(rou).input_ids) + 1
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 1
 
             target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
-
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
 
@@ -223,24 +188,7 @@ def preprocess_plain(
         sources: Sequence[str],
         tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
-    """
-    Preprocesses a list of conversation sources for tokenization in a plain format.
-
-    This function processes a list of conversation sources, ensuring that each source
-    contains exactly two elements and that the first element includes a default image token.
-    It concatenates the values of the two elements with a separator and tokenizes the resulting
-    conversation. The function also masks certain parts of the tokenized data to ignore them
-    during training.
-
-    Args:
-        sources (Sequence[str]): A sequence of conversation sources, where each source is a list
-                                 of two sentences. The first sentence must contain a default image token.
-        tokenizer (transformers.PreTrainedTokenizer): A tokenizer to convert text into token IDs.
-
-    Returns:
-        Dict: A dictionary containing tokenized input IDs and labels, with certain parts masked.
-    """
-    # add end signal and concatenate together
+    """간단 포맷의 멀티모달 대화 전처리."""
     conversations = []
     for source in sources:
         assert len(source) == 2
@@ -248,7 +196,6 @@ def preprocess_plain(
         source[0]['value'] = DEFAULT_IMAGE_TOKEN
         conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep
         conversations.append(conversation)
-    # tokenize conversations
     input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
@@ -262,55 +209,13 @@ def preprocess(
         tokenizer: transformers.PreTrainedTokenizer,
         has_image: bool = False
 ) -> Dict:
-    """
-    Preprocesses a list of conversation sources for tokenization.
-
-    This function processes a list of conversation sources, applying different preprocessing
-    strategies based on the conversation separator style and version. It handles both text
-    and multimodal data (if images are present). The function also masks certain parts of
-    the tokenized data to ignore them during training.
-
-    Args:
-        sources (Sequence[str]): A sequence of conversation sources, where each source is a list of sentences.
-        tokenizer (transformers.PreTrainedTokenizer): A tokenizer to convert text into token IDs.
-        has_image (bool): A flag indicating whether the data includes images.
-
-    Returns:
-        Dict: A dictionary containing tokenized input IDs and labels.
-    """
+    """대화 전처리 엔트리포인트 (버전/구분자 스타일에 따라 분기)."""
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     elif conversation_lib.default_conversation.version.startswith("v0"):
         return preprocess_v0(sources, tokenizer, has_image=has_image)
     else:
         raise ValueError(f"Invalid version: {conversation_lib.default_conversation.version}")
-    # add end signal and concatenate together
-    conversations = []
-    for source in sources:
-        header = f"{conversation_lib.default_conversation.system}\n\n"
-        conversation = _add_speaker_and_signal(header, source)
-        conversations.append(conversation)
-
-    # tokenize conversations
-    def get_tokenize_len(prompts):
-        return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
-
-    if has_image:
-        input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
-    else:
-        conversations_tokenized = _tokenize_fn(conversations, tokenizer)
-        input_ids = conversations_tokenized["input_ids"]
-
-    targets = copy.deepcopy(input_ids)
-    for target, source in zip(targets, sources):
-        if has_image:
-            tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
-        else:
-            tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
-        speakers = [sentence["from"] for sentence in source]
-        _mask_targets(target, tokenized_lens, speakers)
-
-    return dict(input_ids=input_ids, labels=targets)
 
 
 class LazySupervisedDataset(Dataset):
@@ -322,20 +227,15 @@ class LazySupervisedDataset(Dataset):
                  data_ratio: int,
                  concat: str,
                  data_args,
-                 use_state=False): # use_state=False 츄가함
-        self.use_state=use_state # 추가함
+                 use_state: bool = False):  # use_state 기본 False
+        self.use_state = use_state
 
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
-        # if data_type == 'train':
-        #     list_data_dict = list_data_dict[:int(data_ratio*len(list_data_dict))]
-        # elif data_type == 'eval':
-        #     list_data_dict = list_data_dict[int(data_ratio*len(list_data_dict)):]
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
         self.concat = concat
-        
 
         image_file = self.list_data_dict[0]['image']
         image_folder = self.data_args.image_folder
@@ -365,7 +265,6 @@ class LazySupervisedDataset(Dataset):
         return length_list
 
     def parse_image(self, i, image_file):
-        # image_file = self.list_data_dict[i]['image']
         if isinstance(image_file, str):
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
@@ -386,10 +285,6 @@ class LazySupervisedDataset(Dataset):
                     result.paste(pil_img, ((height - width) // 2, 0))
                     return result
 
-            # print("##"*50)
-            # print(processor.image_mean)
-            # exit(0)
-
             image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
             image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
         else:
@@ -399,14 +294,9 @@ class LazySupervisedDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
 
-        # 상태와 액션은 필요할 때만 안전하게 로드
-        action = None
-        state = None
-
-        if 'action' in sources:
-            action = sources['action']
-        if self.use_state and 'state' in sources:
-            state = sources['state']
+        # 상태/액션은 필요할 때만 안전하게 로드
+        action = sources.get('action', None)
+        state = sources.get('state', None) if self.use_state else None
 
         if isinstance(i, int):
             sources = [sources]
@@ -462,65 +352,68 @@ class LazySupervisedDataset(Dataset):
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
-
-    tokenizer: transformers.PreTrainedTokenizer #추가
-    use_state: bool = False #추가
-    """
-    Collate examples for supervised fine-tuning.
-
-    This class is responsible for preparing batches of data for supervised training.
-    It processes a sequence of instances, each containing input IDs, labels, and potentially
-    other data like actions, states, and images. The class ensures that all sequences are
-    padded to the same length and that any missing or invalid data is handled appropriately.
-
-    Attributes:
-        tokenizer (transformers.PreTrainedTokenizer): The tokenizer used to convert text into token IDs.
-    """
+    """SFT용 배치 콜레이터. use_state에 따라 states를 수집/대체."""
     tokenizer: transformers.PreTrainedTokenizer
+    use_state: bool = False
+    state_dim: int = 7  # qpos dim 기본 7
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        # 텍스트 패딩
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
-        # temp_pad_token_id = 51000
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
             padding_value=self.tokenizer.pad_token_id
-            # padding_value=temp_pad_token_id
         )
-        labels = torch.nn.utils.rnn.pad_sequence(labels,
-                                                 batch_first=True,
-                                                 padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels,
+            batch_first=True,
+            padding_value=IGNORE_INDEX
+        )
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
 
+        # 액션 수집
         if not isinstance(instances[0]['action'], torch.Tensor):
             actions = torch.tensor(np.array([instance['action'] for instance in instances]))
-            states = torch.tensor(np.array([instance['state'][0:] for instance in instances]))
         else:
             actions = torch.stack([instance['action'] for instance in instances])
-            states = torch.stack([instance['state'][0:] for instance in instances])
 
-        is_pad_all = torch.stack([instance['is_pad'] for instance in instances])
+        # 상태 수집 (use_state=False면 제로 텐서로 대체)
+        if self.use_state and ('state' in instances[0]):
+            if not isinstance(instances[0]['state'], torch.Tensor):
+                states = torch.tensor(np.array([instance['state'][0:] for instance in instances]))
+            else:
+                states = torch.stack([instance['state'][0:] for instance in instances])
+        else:
+            B = len(instances)
+            states = torch.zeros((B, self.state_dim), dtype=actions.dtype, device=actions.device)
+
+        # is_pad (있을 때만)
+        is_pad_all = None
+        if 'is_pad' in instances[0]:
+            is_pad_all = torch.stack([instance['is_pad'] for instance in instances])
+
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
             actions=actions,
             states=states,
-            images_r=None,
-            is_pad=is_pad_all,
-            
-            # attention_mask=input_ids.ne(temp_pad_token_id),
         )
 
+        if is_pad_all is not None:
+            batch['is_pad'] = is_pad_all
+
+        # 이미지들
         if 'image' in instances[0]:
-            # keys.append('images')
             images = [instance['image'].squeeze() for instance in instances]
             if 'image_r' in instances[0].keys():
                 images_right = [instance['image_r'].squeeze() for instance in instances]
             if 'image_top' in instances[0].keys():
                 images_top = [instance['image_top'].squeeze() for instance in instances]
+
             if all(x is not None and x.shape == images[0].shape for x in images):
                 batch['images'] = torch.stack(images)
                 if 'image_r' in instances[0].keys():
@@ -529,13 +422,12 @@ class DataCollatorForSupervisedDataset(object):
                     batch['images_top'] = torch.stack(images_top)
             else:
                 batch['images'] = images
-        # print("9"*50)
-        # print(batch[images_r.shape])
-        for key in ['actions', 'images', 'images_r']:
-            batch[key] = torch.nan_to_num(batch[key])
 
-        # for k,v in batch.items():
-        #     batch[k] = v.to(dtype=torch.bfloat16)
+        # NaN 방지 (텐서인 것만)
+        for key in ['actions', 'images', 'images_r', 'images_top']:
+            if key in batch and isinstance(batch[key], torch.Tensor):
+                batch[key] = torch.nan_to_num(batch[key])
+
         return batch
 
 
@@ -544,24 +436,25 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     """Make dataset and collator for supervised fine-tuning."""
 
     train_eval_split = 0.9
-    # print("$"*50)
-    # print(concat)
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                           data_ratio=train_eval_split,
                                           data_type='train',
                                           data_path=data_args.data_path,
                                           data_args=data_args,
-                                          concat=concat, use_state=data_args.use_state) #use_state=use_state 추가
+                                          concat=concat, use_state=data_args.use_state)
     assert 'train' in data_args.data_path or 'eval' in data_args.data_path, "Please use train eval split data!!!!!"
     eval_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                          data_ratio=train_eval_split,
                                          data_type='eval',
                                          data_path=data_args.data_path.replace('train', 'eval'),
                                          data_args=data_args,
-                                         concat=concat, use_state=data_args.use_state) # use_state=use_state 추가
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, use_state=data_args.use_state) # use_state=use_state 추가
+                                         concat=concat, use_state=data_args.use_state)
+    data_collator = DataCollatorForSupervisedDataset(
+        tokenizer=tokenizer,
+        use_state=data_args.use_state,   # 플래그 전달
+        state_dim=7                      # 필요 시 설정에서 가져오도록 변경 가능
+    )
 
     return dict(train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
-                # eval_dataset=None,
                 data_collator=data_collator)
